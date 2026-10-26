@@ -1,6 +1,6 @@
 {
   "name": "bare-stow-host",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Host side of the bare-stow lifecycle",
   "exports": {
     "./package": "./package.json",
