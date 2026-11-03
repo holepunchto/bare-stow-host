@@ -24,8 +24,14 @@ interface IPCOptions {
  * The host side of a stowed bundle's lifecycle, layered on a `Protocol`. It emits `exit` with the
  * code the worker signals, and `close` once the underlying transport closes. It emits `error` when
  * the worker reports a fault, when it exits without saying why, such as through `Bare.exit()`, a
- * signal, or a crash, or when the underlying transport errors, and is destroyed either way. For a
- * worker that exited without saying why, `err.exitCode` and `err.signalCode` carry the reason.
+ * signal, or a crash, or when the underlying transport errors, and is destroyed either way.
+ *
+ * The errors that it raises carry a `code`: `WORKER_ERROR` for a fault the worker reported,
+ * `WORKER_EXITED` with `exitCode` for a worker that exited, `WORKER_KILLED` with `signalCode` for a
+ * worker killed by a signal, `WORKER_CLOSED` for a transport that closed before ready, and
+ * `WORKER_TIMEOUT` for a worker that timed out before ready, and `TRANSPORT_ERROR` with `cause` for
+ * a transport that failed while reading or writing. A transport that is reset or broken by the
+ * worker going away counts as closing rather than failing.
  *
  * Destroying it sends a `terminate` control frame to the worker and waits for the underlying
  * transport to close, calling `kill` if the worker hasn't exited within `grace`.
@@ -42,9 +48,13 @@ interface IPC extends Protocol {
    */
   terminate(): Promise<number | undefined>
   /**
-   * Report that the worker has exited, as observed by the transport. If the worker exited without
-   * saying why and was not asked to, the handle is destroyed with an error carrying the reason as
-   * `exitCode` and `signalCode`.
+   * Report that the worker has exited, as observed by the transport. Whoever wraps the transport
+   * must call it once the worker exits. If the worker exited without saying why and was not asked
+   * to, the handle is destroyed with a `WORKER_EXITED` or `WORKER_KILLED` error carrying the reason
+   * as `exitCode` and `signalCode`. Until then, the end of a transport that ends without the worker
+   * saying why is held back. A transport that fails instead waits for the exit for `grace`
+   * milliseconds, failing with the exit and the failure as its `cause`, or killing the worker and
+   * failing with `TRANSPORT_ERROR` if it hasn't exited by then.
    * @param code - The exit code of the worker, or `null` if it was killed by a signal.
    * @param signal - The signal that killed the worker, or `null` (default `null`).
    */

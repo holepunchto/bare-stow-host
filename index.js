@@ -10,6 +10,9 @@ class IPC extends Protocol {
     this._grace = grace
     this._terminating = null
     this._exitReported = false
+    this._timer = null
+    this._failure = null
+    this._failing = null
 
     this.once('exit', () => {
       this._exitReported = true
@@ -18,13 +21,16 @@ class IPC extends Protocol {
     this.send('configure', { grace })
 
     this._ready = new Promise((resolve, reject) => {
-      const timer =
+      this._timer =
         timeout === null
           ? null
-          : setTimeout(() => onerror(new Error('Worker timed out before ready')), timeout)
+          : setTimeout(
+              () => onerror(workerError('Worker timed out before ready', 'WORKER_TIMEOUT')),
+              timeout
+            )
 
       const cleanup = () => {
-        clearTimeout(timer)
+        clearTimeout(this._timer)
         this.off('ready', onready).off('error', onerror).off('exit', onexit).off('close', onclose)
       }
 
@@ -41,10 +47,14 @@ class IPC extends Protocol {
       const onexit = (code) => {
         // An error frame precedes the exit frame and is emitted on destroy
         if (this.destroying) return
-        onerror(new Error(`Worker exited with code ${code} before ready`))
+        onerror(
+          workerError(`Worker exited with code ${code} before ready`, 'WORKER_EXITED', {
+            exitCode: code
+          })
+        )
       }
 
-      const onclose = () => onerror(new Error('Worker closed before ready'))
+      const onclose = () => onerror(workerError('Worker closed before ready', 'WORKER_CLOSED'))
 
       this.on('ready', onready).on('error', onerror).on('exit', onexit).on('close', onclose)
     })
@@ -73,14 +83,57 @@ class IPC extends Protocol {
     // The worker either said why it exited or was asked to.
     if (this._exitReported || this._terminating !== null || this.destroying) return
 
-    const err = new Error(
-      signal === null ? `Worker exited with code ${code}` : `Worker was killed by ${signal}`
-    )
+    const err =
+      signal === null
+        ? workerError(`Worker exited with code ${code}`, 'WORKER_EXITED', { exitCode: code })
+        : workerError(`Worker was killed by ${signal}`, 'WORKER_KILLED', {
+            exitCode: code,
+            signalCode: signal
+          })
 
-    err.exitCode = code
-    err.signalCode = signal
+    if (this._failure !== null) {
+      clearTimeout(this._failing)
+      err.cause = this._failure
+    }
 
     this.destroy(err)
+  }
+
+  // A worker whose transport ends without it saying why has crashed, so the end
+  // is held back until its exit is reported for readers to fail with. It can no
+  // longer time out, as it already ended.
+  _onend() {
+    if (this._crashed()) clearTimeout(this._timer)
+    else super._onend()
+  }
+
+  _onclose() {
+    if (this._crashed()) clearTimeout(this._timer)
+    else super._onclose()
+  }
+
+  // A peer that goes away resets or breaks the connection rather than ending
+  // it, which is no different from it closing. Other failures of the transport
+  // of a worker that may have crashed wait for its exit as an end does, killing
+  // it if it hasn't exited within the grace period.
+  _onerror(err) {
+    if (err.code === 'ECONNRESET' || err.code === 'EPIPE') return this._onclose()
+
+    const failure = workerError(err.message, 'TRANSPORT_ERROR', { cause: err })
+
+    if (!this._crashed()) return this.destroy(failure)
+
+    clearTimeout(this._timer)
+
+    this._failure = failure
+    this._failing = setTimeout(() => {
+      this._kill()
+      this.destroy(failure)
+    }, this._grace)
+  }
+
+  _crashed() {
+    return !this._exitReported && this._terminating === null && !this.destroying
   }
 
   _destroy(err, cb) {
@@ -105,6 +158,14 @@ class IPC extends Protocol {
 
     return this._terminating
   }
+}
+
+function workerError(message, code, props) {
+  const err = new Error(message)
+
+  err.code = code
+
+  return Object.assign(err, props)
 }
 
 exports.IPC = IPC

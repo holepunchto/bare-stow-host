@@ -31,7 +31,7 @@
   },
   "homepage": "https://github.com/holepunchto/bare-stow-host#readme",
   "dependencies": {
-    "bare-stow-protocol": "^0.1.0",
+    "bare-stow-protocol": "^0.1.1",
     "bare-stream": "^2.13.1"
   },
   "devDependencies": {
