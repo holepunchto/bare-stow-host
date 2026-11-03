@@ -23,7 +23,10 @@ test('host wrap rejects ready when worker errors before ready', async (t) => {
   worker.on('terminate', () => right.destroy())
   worker.send('error', { message: 'boom' })
 
-  await t.exception(ipc.ready, /boom/)
+  const err = await ipc.ready.catch((err) => err)
+
+  t.is(err.message, 'boom')
+  t.is(err.code, 'WORKER_ERROR')
 })
 
 test('host wrap rejects ready when worker exits before ready', async (t) => {
@@ -34,16 +37,52 @@ test('host wrap rejects ready when worker exits before ready', async (t) => {
   worker.on('terminate', () => right.destroy())
   worker.send('exit', { code: 1 })
 
-  await t.exception(ipc.ready, /exited with code 1 before ready/)
+  const err = await ipc.ready.catch((err) => err)
+
+  t.is(err.code, 'WORKER_EXITED')
+  t.is(err.exitCode, 1)
 })
 
-test('host wrap rejects ready when stream closes before ready', async (t) => {
-  const [left] = pair()
+test('host wrap rejects ready when destroyed before ready', async (t) => {
+  const [left, right] = pair()
   const ipc = host.wrap(left)
+  const worker = protocol.attach(right)
 
-  left.destroy()
+  worker.on('terminate', () => right.destroy())
 
-  await t.exception(ipc.ready, /closed before ready/)
+  ipc.destroy()
+
+  const err = await ipc.ready.catch((err) => err)
+
+  t.is(err.code, 'WORKER_CLOSED')
+})
+
+test('host wrap rejects ready when the transport fails', async (t) => {
+  const [left] = pair()
+  const ipc = host.wrap(left, { grace: 10 })
+  const failure = new Error('broken')
+
+  left.destroy(failure)
+
+  const err = await ipc.ready.catch((err) => err)
+
+  t.is(err.code, 'TRANSPORT_ERROR')
+  t.is(err.cause, failure)
+})
+
+test('host wrap rejects ready when writing to the transport fails', async (t) => {
+  const failure = new Error('broken')
+  const stream = new Duplex({
+    write(data, encoding, cb) {
+      cb(failure)
+    }
+  })
+  const ipc = host.wrap(stream, { grace: 10 })
+
+  const err = await ipc.ready.catch((err) => err)
+
+  t.is(err.code, 'TRANSPORT_ERROR')
+  t.is(err.cause, failure)
 })
 
 test('host wrap ignores exit after ready', async (t) => {
@@ -114,15 +153,19 @@ test('host destroy sends terminate to worker', (t) => {
   ipc.destroy()
 })
 
-test('host emits close when underlying stream closes', (t) => {
+test('host emits close when underlying stream closes', async (t) => {
   t.plan(1)
 
-  const [left] = pair()
+  const [left, right] = pair()
   const ipc = host.wrap(left)
+  const worker = protocol.attach(right)
 
-  ipc.on('close', () => t.pass('close fired'))
+  ipc.on('close', () => t.pass('close fired')).resume()
 
-  left.destroy()
+  worker.send('exit', { code: 0 })
+  await new Promise((resolve) => ipc.once('exit', resolve))
+
+  right.destroy()
 })
 
 test('host wrap rejects ready and terminates the worker on timeout', (t) => {
@@ -137,7 +180,7 @@ test('host wrap rejects ready and terminates the worker on timeout', (t) => {
     right.destroy()
   })
 
-  t.exception(ipc.ready, /timed out before ready/)
+  ipc.ready.catch((err) => t.is(err.code, 'WORKER_TIMEOUT'))
 })
 
 test('host terminate kills the worker after the grace period', async (t) => {
@@ -183,12 +226,17 @@ test('host destroy kills the worker after the grace period', (t) => {
 })
 
 test('host terminate resolves once the stream has closed', async (t) => {
-  const [left] = pair()
+  const [left, right] = pair()
   const ipc = host.wrap(left)
+  const worker = protocol.attach(right)
 
-  left.destroy()
+  ipc.resume()
 
-  await t.exception(ipc.ready, /closed before ready/)
+  worker.send('exit', { code: 0 })
+  await new Promise((resolve) => ipc.once('exit', resolve))
+
+  right.destroy()
+  await new Promise((resolve) => ipc.once('close', resolve))
 
   t.is(await ipc.terminate(), undefined)
 })
@@ -201,7 +249,7 @@ test('host exited before ready rejects ready with the exit code', async (t) => {
 
   const err = await ipc.ready.catch((err) => err)
 
-  t.is(err.message, 'Worker exited with code 3')
+  t.is(err.code, 'WORKER_EXITED')
   t.is(err.exitCode, 3)
 })
 
@@ -219,7 +267,7 @@ test('host exited after ready emits an error with the signal', async (t) => {
 
   const err = await error
 
-  t.is(err.message, 'Worker was killed by SIGKILL')
+  t.is(err.code, 'WORKER_KILLED')
   t.is(err.signalCode, 'SIGKILL')
 })
 
@@ -256,6 +304,132 @@ test('host exited is ignored while terminating', async (t) => {
   ipc.exited(null, 'SIGKILL')
 
   t.is(await terminated, undefined)
+})
+
+test('host holds the end of a crashed worker until its exit is reported', async (t) => {
+  const [left, right] = pair()
+  const ipc = host.wrap(left)
+  const worker = protocol.attach(right)
+
+  worker.send('ready')
+  await ipc.ready
+
+  const error = new Promise((resolve) => ipc.once('error', resolve))
+
+  right.destroy()
+  await new Promise((resolve) => left.once('close', resolve))
+
+  t.absent(ipc.destroyed)
+
+  ipc.exited(null, 'SIGSEGV')
+
+  const err = await error
+
+  t.is(err.code, 'WORKER_KILLED')
+  t.is(err.signalCode, 'SIGSEGV')
+})
+
+test('host holds the close of a worker that crashes before ready', async (t) => {
+  const [left, right] = pair()
+  const ipc = host.wrap(left)
+
+  right.destroy()
+  await new Promise((resolve) => left.once('close', resolve))
+
+  ipc.exited(1)
+
+  const err = await ipc.ready.catch((err) => err)
+
+  t.is(err.code, 'WORKER_EXITED')
+  t.is(err.exitCode, 1)
+})
+
+test('host fails a crashed worker with its exit rather than a timeout', async (t) => {
+  const [left, right] = pair()
+  const ipc = host.wrap(left, { timeout: 50 })
+
+  right.destroy()
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  ipc.exited(1)
+
+  const err = await ipc.ready.catch((err) => err)
+
+  t.is(err.code, 'WORKER_EXITED')
+})
+
+test('host fails a crashed worker with its exit rather than a transport failure', async (t) => {
+  const [left] = pair()
+  const ipc = host.wrap(left)
+  const failure = new Error('broken')
+
+  left.destroy(failure)
+  await new Promise((resolve) => left.once('close', resolve))
+
+  ipc.exited(null, 'SIGSEGV')
+
+  const err = await ipc.ready.catch((err) => err)
+
+  t.is(err.code, 'WORKER_KILLED')
+  t.is(err.cause.cause, failure)
+})
+
+test('host kills a worker whose transport fails and that does not exit', async (t) => {
+  t.plan(3)
+
+  const [left] = pair()
+  const failure = new Error('broken')
+  const ipc = host.wrap(left, {
+    grace: 10,
+    kill: () => t.pass('killed')
+  })
+
+  left.destroy(failure)
+
+  const err = await ipc.ready.catch((err) => err)
+
+  t.is(err.code, 'TRANSPORT_ERROR')
+  t.is(err.cause, failure)
+})
+
+test('host treats a reset transport as closed', async (t) => {
+  const [left] = pair()
+  const ipc = host.wrap(left)
+  const reset = new Error('reset')
+
+  reset.code = 'ECONNRESET'
+
+  left.destroy(reset)
+  await new Promise((resolve) => left.once('close', resolve))
+
+  ipc.exited(1)
+
+  const err = await ipc.ready.catch((err) => err)
+
+  t.is(err.code, 'WORKER_EXITED')
+  t.absent(err.cause)
+})
+
+test('host ends a worker that exits on its own without holding', async (t) => {
+  const [left, right] = pair()
+  const ipc = host.wrap(left)
+  const worker = protocol.attach(right)
+
+  worker.send('ready')
+  await ipc.ready
+
+  ipc.resume()
+
+  const closed = new Promise((resolve) => ipc.once('close', resolve))
+
+  worker.send('exit', { code: 0 })
+  await new Promise((resolve) => ipc.once('exit', resolve))
+
+  right.destroy()
+
+  await closed
+
+  t.pass('closed')
 })
 
 function pair() {
